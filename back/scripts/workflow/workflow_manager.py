@@ -5,7 +5,9 @@ from pathlib import Path
 import pandas as pd
 
 from back.scripts.communities.communities_selector import CommunitiesSelector
+from back.scripts.communities.loaders.ofgl import OfglLoader
 from back.scripts.datasets.communities_financial_accounts import FinancialAccounts
+from back.scripts.datasets.cpv_labels import CPVLabelsWorkflow
 from back.scripts.datasets.datagouv_catalog import DataGouvCatalog
 from back.scripts.datasets.datagouv_searcher import (
     DataGouvSearcher,
@@ -36,26 +38,20 @@ class WorkflowManager:
 
     def run_workflow(self):
         self.logger.info("Workflow started.")
-        DataGouvCatalog(self.config["datagouv_catalog"]).run()
-        MarchesPublicsWorkflow.from_config(self.config["marches_publics"]).run()
-        FinancialAccounts(self.config["financial_accounts"]).run()
-        ElectedOfficialsWorkflow(self.config["elected_officials"]).run()
-        SireneWorkflow(self.config["sirene"]).run()
-        DeclaInteretWorkflow(self.config["declarations_interet"]).run()
-        self._run_subvention_and_marche()
+        CPVLabelsWorkflow(self.config).run()
+        SireneWorkflow(self.config).run()
+        OfglLoader.from_config(self.config).run()
+        CommunitiesSelector(self.config).run()
+        DataGouvCatalog(self.config).run()
+        MarchesPublicsWorkflow.from_config(self.config).run()
+        FinancialAccounts(self.config).run()
+        ElectedOfficialsWorkflow(self.config).run()
+        DeclaInteretWorkflow(self.config).run()
+        DataGouvSearcher(self.config).run()
+
+        self.process_subvention("subventions", self.config["search"]["subventions"])
 
         self.logger.info("Workflow completed.")
-
-    def _run_subvention_and_marche(self):
-        # If communities files are already generated, check the age
-        self.check_file_age(self.config["file_age_to_check"])
-
-        communities_selector = self.initialize_communities_scope()
-
-        # Loop through the topics defined in the config, e.g. marches publics or subventions.
-        for topic, topic_config in self.config["search"].items():
-            # Process each topic to get files in scope and datafiles
-            self.process_topic(communities_selector, topic, topic_config)
 
     def check_file_age(self, config):
         """
@@ -77,47 +73,32 @@ class WorkflowManager:
                         f"{filename} file is older than {max_age_in_days} days. It is advised to refresh your data."
                     )
 
-    def initialize_communities_scope(self):
-        self.logger.info("Initializing communities scope.")
-        # Initialize CommunitiesSelector with the config and select communities
-        config = self.config["communities"] | {"sirene": self.config["sirene"]}
-        communities_selector = CommunitiesSelector(config)
-
-        self.logger.info("Communities scope initialized.")
-        return communities_selector
-
-    def process_topic(self, communities_selector, topic, topic_config):
-        self.logger.info(f"Processing topic {topic}.")
+    def process_subvention(self, topic, topic_config):
+        self.logger.info(f"Processing subvention {topic}.")
         topic_files_in_scope = None
 
-        if topic_config["source"] == "multiple":
-            # Find multiple datafiles from datagouv
-            config = self.config["datagouv"]
-            config["datagouv_api"] = self.config["datagouv_api"]
-            datagouv_searcher = DataGouvSearcher(communities_selector, config)
-            datagouv_topic_files_in_scope = datagouv_searcher.select_datasets(topic_config)
+        datagouv_topic_files_in_scope = pd.read_parquet(
+            DataGouvSearcher.get_output_path(self.config)
+        )
 
-            # Find single datafiles from single urls (standalone datasources outside of datagouv)
-            single_urls_builder = SingleUrlsBuilder(communities_selector)
-            single_urls_topic_files_in_scope = single_urls_builder.get_datafiles(topic_config)
-
-            # Concatenate both datafiles lists into one
-            topic_files_in_scope = (
-                pd.concat(
-                    [datagouv_topic_files_in_scope, single_urls_topic_files_in_scope],
-                    ignore_index=True,
-                )
-                .dropna(subset=["url"])
-                .pipe(correct_format_from_url)
-                .pipe(sort_by_format_priorities)
-                .drop_duplicates(subset=["url"], keep="first")
-                .pipe(remove_same_dataset_formats)
-                .pipe(select_implemented_formats)
+        # Find single datafiles from single urls (standalone datasources outside of datagouv)
+        single_urls_builder = SingleUrlsBuilder()
+        single_urls_topic_files_in_scope = single_urls_builder.get_datafiles(topic_config)
+        # Concatenate both datafiles lists into one
+        topic_files_in_scope = (
+            pd.concat(
+                [datagouv_topic_files_in_scope, single_urls_topic_files_in_scope],
+                ignore_index=True,
             )
+            .dropna(subset=["url"])
+            .pipe(correct_format_from_url)
+            .pipe(sort_by_format_priorities)
+            .drop_duplicates(subset=["url"], keep="first")
+            .pipe(remove_same_dataset_formats)
+            .pipe(select_implemented_formats)
+        )
 
-            topic_agg = TopicAggregator(
-                topic_files_in_scope, topic, topic_config, self.config["datafile_loader"]
-            )
-            topic_agg.run()
+        topic_agg = TopicAggregator(topic_files_in_scope, topic, self.config["datafile_loader"])
+        topic_agg.run()
 
-            return topic_files_in_scope, topic_agg.aggregated_dataset
+        return topic_files_in_scope, topic_agg.aggregated_dataset
